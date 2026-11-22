@@ -1,18 +1,22 @@
 import { useMemo, useState } from 'react';
 import Sheet from '../components/Sheet.jsx';
 import { ArrowUpRightIcon } from '../components/Icons.jsx';
-import { PLANS, TODAYS_PLAN_ID } from '../data/plans.js';
-import { completedSessionOn, cycleDayFor, lastSessionSets, useStore } from '../data/store.js';
+import { EXERCISES, estimateMinutes, suggestionExercise } from '../data/plans.js';
+import { completedSessionOn, cycleDayFor, getSelectedRoutine, lastSessionSets, useStore } from '../data/store.js';
 import { suggestWeight } from '../data/suggest.js';
 import { formatLongDate, todayKey } from '../lib/date.js';
 import { formatWeight } from '../lib/units.js';
 import { CRAMP_OPTIONS, ENERGY_OPTIONS, FLOW_OPTIONS, labelFor } from './CheckInSheet.jsx';
 
 function whyThisWorkout(plan, checkIn) {
-  const lines = [
-    `${plan.name} works your ${plan.focus} with ${plan.exercises.length} moves that build a strong base: a squat, a hinge and a single-leg lunge.`,
-    'Each exercise uses moderate reps (8–10), which is a good range for building strength and learning form.',
-  ];
+  const names = plan.exercises.map((ex) => EXERCISES[ex.exerciseId].name.toLowerCase());
+  const lines =
+    plan.builtIn && !plan.updatedAt
+      ? [
+          `${plan.name} works your ${plan.focus} with ${plan.exercises.length} moves that build a strong base: a squat, a hinge and a single-leg lunge.`,
+          'Each exercise uses moderate reps (8–10), which is a good range for building strength and learning form.',
+        ]
+      : [`${plan.name} is your own routine: ${names.join(', ')}.`];
   if (checkIn?.status === 'done') {
     const easier =
       checkIn.energy === 'low' || ['moderate', 'strong'].includes(checkIn.cramps) || checkIn.flow === 'heavy';
@@ -27,17 +31,17 @@ function whyThisWorkout(plan, checkIn) {
   return lines;
 }
 
-export default function Today({ onStartWorkout, onEditCheckIn, onViewCycle, onToast }) {
+export default function Today({ onStartWorkout, onEditCheckIn, onViewCycle, onBuildOwn }) {
   const s = useStore();
   const date = todayKey();
-  const plan = PLANS[TODAYS_PLAN_ID];
+  const plan = getSelectedRoutine(s);
   const checkIn = s.checkIns[date];
   const cycle = cycleDayFor(s, date);
   const active = s.activeWorkout;
   const doneToday = completedSessionOn(s, date);
   const [whyOpen, setWhyOpen] = useState(false);
 
-  const first = plan.exercises[0];
+  const first = useMemo(() => suggestionExercise(plan.exercises[0], plan.unit), [plan]);
   const firstUp = useMemo(
     () =>
       suggestWeight({
@@ -49,6 +53,7 @@ export default function Today({ onStartWorkout, onEditCheckIn, onViewCycle, onTo
       }),
     [s, first, active?.sessionId, checkIn]
   );
+  const firstTimed = EXERCISES[first.id].timed;
 
   const inProgress = active?.startedAt && active.planId === plan.id;
   const loggedToday = doneToday.reduce(
@@ -68,14 +73,16 @@ export default function Today({ onStartWorkout, onEditCheckIn, onViewCycle, onTo
           {plan.name}
         </h2>
         <p className="plan-meta">
-          {plan.exercises.length} exercises · about {plan.estMinutes} min
+          {plan.exercises.length} {plan.exercises.length === 1 ? 'exercise' : 'exercises'} · about{' '}
+          {estimateMinutes(plan, s.prefs.restSec)} min
         </p>
 
         <div className="first-up">
           <div className="eyebrow">First up</div>
           <div className="first-up-name">{first.name}</div>
           <div className="first-up-meta">
-            {first.sets} sets × {first.reps} reps · {formatWeight(firstUp.weight)} {firstUp.unit}
+            {first.sets} {first.sets === 1 ? 'set' : 'sets'}
+            {firstTimed ? ' · timed' : ` × ${first.reps} reps · ${formatWeight(firstUp.weight)} ${firstUp.unit}`}
           </div>
         </div>
 
@@ -96,7 +103,7 @@ export default function Today({ onStartWorkout, onEditCheckIn, onViewCycle, onTo
 
       <button
         className="btn text build-own"
-        onClick={() => onToast('Building your own workout arrives in a later pass.')}
+        onClick={onBuildOwn}
       >
         Build my own workout
       </button>

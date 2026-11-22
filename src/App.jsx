@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { BottomNav, Header } from './components/Chrome.jsx';
 import Sheet from './components/Sheet.jsx';
-import { TODAYS_PLAN_ID } from './data/plans.js';
 import { ensureActiveWorkout, resetAllData, startWorkout, useStore } from './data/store.js';
 import { formatShortDate, todayKey } from './lib/date.js';
 import CheckInSheet from './screens/CheckInSheet.jsx';
@@ -25,6 +24,7 @@ export default function App() {
   const [editCheckIn, setEditCheckIn] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState(null);
+  const [editorRequest, setEditorRequest] = useState(null);
   const toastTimer = useRef(null);
   const scrollRef = useRef(null);
 
@@ -45,14 +45,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (tab === 'workout') ensureActiveWorkout(TODAYS_PLAN_ID);
+    if (tab === 'workout') ensureActiveWorkout();
   }, [tab]);
 
   // First visit of the day: ask until the lifter saves or skips.
   const needsCheckIn = !s.checkIns[date];
 
   const startFromToday = () => {
-    ensureActiveWorkout(TODAYS_PLAN_ID);
+    ensureActiveWorkout();
     startWorkout();
     setTab('workout');
   };
@@ -73,14 +73,20 @@ export default function App() {
               onStartWorkout={startFromToday}
               onEditCheckIn={() => setEditCheckIn(true)}
               onViewCycle={() => setTab('cycle')}
-              onToast={showToast}
+              onBuildOwn={() => {
+                setEditorRequest({ routineId: null, at: Date.now() });
+                setTab('workout');
+              }}
             />
           )}
           {tab === 'workout' && (
             <Workout
+              editorRequest={editorRequest}
+              onEditorRequestHandled={() => setEditorRequest(null)}
               onToast={showToast}
               onFinished={(msg) => {
                 showToast(msg);
+                setEditorRequest(null);
                 setTab('today');
               }}
             />
@@ -130,7 +136,7 @@ export default function App() {
 
         <Sheet open={menuOpen} eyebrow="Menu" title="Tempo" onClose={() => setMenuOpen(false)}>
           <p className="muted small sheet-lede">
-            Goals, plans, meals and history screens arrive in later passes.
+            Goals, meals and history screens arrive in later passes.
           </p>
           <button
             className="btn secondary block"

@@ -4,7 +4,8 @@ import HeartTimer from '../components/HeartTimer.jsx';
 import Sheet from '../components/Sheet.jsx';
 import { ChoicePills } from '../components/Chrome.jsx';
 import { ArrowUpRightIcon, CheckIcon, HeartIcon } from '../components/Icons.jsx';
-import { PLANS } from '../data/plans.js';
+import { EXERCISES, estimateMinutes } from '../data/plans.js';
+import RoutineEditor from './RoutineEditor.jsx';
 import {
   acceptSuggestion,
   addRestTime,
@@ -14,9 +15,13 @@ import {
   endRest,
   finishWorkout,
   lastSessionSets,
+  ensureActiveWorkout,
+  getRoutine,
+  listRoutines,
   restSecFor,
+  selectRoutine,
   setRestDuration,
-  setRestOverride,
+  setExerciseRest,
   setUnit,
   setWarmup,
   startSetTimer,
@@ -29,6 +34,7 @@ import { suggestWeight } from '../data/suggest.js';
 import { formatClock, formatShortTimer } from '../lib/date.js';
 import { convertWeight, formatWeight } from '../lib/units.js';
 import { useNow } from '../hooks/useNow.js';
+import { cleanDecimal, cleanInt, selectOnFocus } from '../lib/inputs.js';
 
 const WARMUP_OPTIONS = [
   { value: 'easy', label: 'Easy' },
@@ -44,18 +50,6 @@ function buzz(pattern) {
   }
 }
 
-/** Tapping a number selects it so typing replaces it. */
-function selectOnFocus(e) {
-  const el = e.target;
-  requestAnimationFrame(() => el.select());
-}
-
-/** Digits with at most one decimal point. */
-function cleanDecimal(v) {
-  const [whole, ...rest] = v.replace(/[^0-9.]/g, '').split('.');
-  return rest.length ? `${whole}.${rest.join('').slice(0, 2)}` : whole;
-}
-
 function runningTimer(timer, now) {
   if (!timer?.startedAt || timer.finished) return null;
   const elapsed = (now - timer.startedAt) / 1000;
@@ -66,10 +60,25 @@ function runningTimer(timer, now) {
   };
 }
 
-export default function Workout({ onFinished, onToast }) {
+export default function Workout({ onFinished, onToast, editorRequest, onEditorRequestHandled }) {
   const s = useStore();
   const draft = s.activeWorkout;
-  const plan = draft ? PLANS[draft.planId] : null;
+  // The workout's own copy of its routine (see createDraft in the store), shaped like a plan.
+  const plan = draft
+    ? {
+        name: draft.name,
+        subtitle:
+          draft.subtitle ??
+          `${draft.exercises.length} ${draft.exercises.length === 1 ? 'exercise' : 'exercises'} · rest to recover`,
+        exercises: draft.exercises.map((dex) => ({
+          ...dex,
+          id: dex.exerciseId,
+          sets: dex.rows.length,
+          reps: dex.targetReps,
+          how: EXERCISES[dex.exerciseId]?.how ?? [],
+        })),
+      }
+    : null;
   const checkIn = draft ? s.checkIns[draft.date] : undefined;
 
   // The timed set (plank etc.) that is currently counting, if any.
@@ -89,6 +98,19 @@ export default function Workout({ onFinished, onToast }) {
   const [timeSetSec, setTimeSetSec] = useState(30);
   const [finishOpen, setFinishOpen] = useState(false);
   const [askOpen, setAskOpen] = useState(false);
+  const [routinesOpen, setRoutinesOpen] = useState(false);
+  const [editor, setEditor] = useState(null); // { routineId } to customize, { routineId: null } to create
+
+  useEffect(() => {
+    if (!draft) ensureActiveWorkout();
+  }, [draft]);
+
+  // "Build my own workout" on Today opens the create editor here.
+  useEffect(() => {
+    if (!editorRequest) return;
+    setEditor({ routineId: editorRequest.routineId ?? null });
+    onEditorRequestHandled?.();
+  }, [editorRequest, onEditorRequestHandled]);
 
   const suggestions = useMemo(() => {
     if (!draft) return [];
@@ -145,7 +167,8 @@ export default function Workout({ onFinished, onToast }) {
   };
 
   const openTimeSet = (exIdx) => {
-    setTimeSetSec(plan.exercises[exIdx].durationSec ?? 30);
+    const next = draft.exercises[exIdx].rows.find((r) => !r.doneSetId);
+    setTimeSetSec(next?.targetDurationSec ?? EXERCISES[draft.exercises[exIdx].exerciseId]?.durationSec ?? 30);
     setTimeSetFor(exIdx);
   };
 
@@ -201,12 +224,29 @@ export default function Workout({ onFinished, onToast }) {
       </div>
 
       <div className="row-between title-row">
-        <h1 className="workout-title">{plan.name}</h1>
+        <button
+          className="routine-switch"
+          onClick={() => setRoutinesOpen(true)}
+          aria-label={`${plan.name}. Choose a different workout`}
+        >
+          <h1 className="workout-title">{plan.name}</h1>
+          <span className="caret" aria-hidden="true">
+            ▾
+          </span>
+        </button>
         <button className="ask-btn" onClick={() => setAskOpen(true)}>
           Ask <ArrowUpRightIcon />
         </button>
       </div>
       <p className="muted tiny">{plan.subtitle}</p>
+      <div className="routine-actions">
+        <button className="ask-btn" onClick={() => setEditor({ routineId: draft.planId })}>
+          Customize workout
+        </button>
+        <button className="ask-btn" onClick={() => setEditor({ routineId: null })}>
+          + Create workout
+        </button>
+      </div>
 
       {plan.exercises.map((ex, exIdx) => {
         const dex = draft.exercises[exIdx];
@@ -217,12 +257,12 @@ export default function Workout({ onFinished, onToast }) {
         const lastLine = last.length
           ? `Last: ${formatWeight(convertWeight(last[0].weight, last[0].unit, unit))} ${unit} × ${last[0].reps}${ex.note ? ' each side' : ''}`
           : ex.note ?? `Plan start: ${formatWeight(sug.base)} ${unit} × ${ex.reps}`;
-        const override = s.prefs.restOverrides?.[ex.id];
+        const override = ex.restSec ?? s.prefs.restOverrides?.[ex.id];
 
         return (
-          <section className="card exercise" key={ex.id} aria-labelledby={`ex-${ex.id}`}>
+          <section className="card exercise" key={ex.key} aria-labelledby={`ex-${ex.key}`}>
             <div className="row-between">
-              <h2 id={`ex-${ex.id}`} className="exercise-name">
+              <h2 id={`ex-${ex.key}`} className="exercise-name">
                 {ex.name}
               </h2>
               <span className="card-links">
@@ -335,7 +375,7 @@ export default function Workout({ onFinished, onToast }) {
                     disabled={done}
                     onFocus={selectOnFocus}
                     onChange={(e) =>
-                      updateRowField(exIdx, rowIdx, 'reps', e.target.value.replace(/[^0-9]/g, '').slice(0, 3))
+                      updateRowField(exIdx, rowIdx, 'reps', cleanInt(e.target.value))
                     }
                     onBlur={(e) =>
                       e.target.value !== '' && updateRowField(exIdx, rowIdx, 'reps', Number(e.target.value) || 0)
@@ -375,19 +415,19 @@ export default function Workout({ onFinished, onToast }) {
           <DurationInput label="Default rest" valueSec={s.prefs.restSec} onChange={setRestDuration} />
         </div>
         <div className="eyebrow rest-group">Per exercise (optional)</div>
-        {plan.exercises.map((ex) => {
-          const sec = s.prefs.restOverrides?.[ex.id];
+        {draft.exercises.map((ex, exIdx) => {
+          const sec = ex.restSec ?? s.prefs.restOverrides?.[ex.exerciseId];
           return (
-            <div className="rest-setting" key={ex.id}>
+            <div className="rest-setting" key={ex.key}>
               <span>{ex.name}</span>
               {sec == null ? (
-                <button className="link small-link" onClick={() => setRestOverride(ex.id, restSecFor(s, ex.id))}>
+                <button className="link small-link" onClick={() => setExerciseRest(exIdx, restSecFor(s, ex))}>
                   Default · Change
                 </button>
               ) : (
                 <span className="rest-override">
-                  <DurationInput label={`${ex.name} rest`} valueSec={sec} onChange={(v) => setRestOverride(ex.id, v)} />
-                  <button className="link small-link" onClick={() => setRestOverride(ex.id, null)}>
+                  <DurationInput label={`${ex.name} rest`} valueSec={sec} onChange={(v) => setExerciseRest(exIdx, v)} />
+                  <button className="link small-link" onClick={() => setExerciseRest(exIdx, null)}>
                     Reset
                   </button>
                 </span>
@@ -556,6 +596,77 @@ export default function Workout({ onFinished, onToast }) {
           <p className="muted small">Save at least one set to keep this workout, or discard it.</p>
         )}
       </Sheet>
+
+      {/* --- Choose a routine --- */}
+      <Sheet
+        open={routinesOpen}
+        eyebrow="Your workouts"
+        title="Choose a workout"
+        onClose={() => setRoutinesOpen(false)}
+        footer={
+          <button
+            className="btn secondary block"
+            onClick={() => {
+              setRoutinesOpen(false);
+              setEditor({ routineId: null });
+            }}
+          >
+            + Create workout
+          </button>
+        }
+      >
+        {draft.startedAt && (
+          <p className="muted small sheet-lede">
+            Finish {draft.name} to switch. You can still edit any workout for next time.
+          </p>
+        )}
+        <ul className="routine-list">
+          {listRoutines(s).map((r) => {
+            const sets = r.exercises.reduce((n, ex) => n + ex.sets.length, 0);
+            const selected = r.id === draft.planId;
+            const locked = !!draft.startedAt && !selected;
+            return (
+              <li key={r.id} className={`routine-item${selected ? ' selected' : ''}`}>
+                <button
+                  className="routine-pick"
+                  disabled={locked}
+                  aria-current={selected ? 'true' : undefined}
+                  onClick={() => {
+                    selectRoutine(r.id);
+                    setRoutinesOpen(false);
+                  }}
+                >
+                  <span className="routine-name">
+                    {selected && <CheckIcon size={14} />} {r.name}
+                  </span>
+                  <span className="muted tiny">
+                    {r.exercises.length} {r.exercises.length === 1 ? 'exercise' : 'exercises'} · {sets} sets · about{' '}
+                    {estimateMinutes(r, s.prefs.restSec)} min
+                  </span>
+                </button>
+                <button
+                  className="link small-link"
+                  onClick={() => {
+                    setRoutinesOpen(false);
+                    setEditor({ routineId: r.id });
+                  }}
+                >
+                  Edit
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </Sheet>
+
+      <RoutineEditor
+        open={!!editor}
+        routine={editor?.routineId ? getRoutine(s, editor.routineId) : null}
+        inProgress={!!draft.startedAt}
+        activeRoutineId={draft.planId}
+        onToast={onToast}
+        onClose={() => setEditor(null)}
+      />
 
       {/* --- Ask (Gemini later) --- */}
       <Sheet open={askOpen} eyebrow="Ask" title="Questions about this workout" onClose={() => setAskOpen(false)}>

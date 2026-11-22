@@ -15,13 +15,28 @@
 //   sets:      [{ id, sessionId, date, planId, exerciseId, exerciseName, setNumber,
 //                 weight, unit, weightKg, reps, targetReps, durationSec, warmup,
 //                 suggestedWeight, completedAt }],
+//   routines:  { [id]: { id, name, builtIn, unit, createdAt, updatedAt,
+//                 exercises: [{ key, exerciseId, note, restSec | null,
+//                               sets: [{ reps, weight | null, durationSec | null }] }] } },
+//   selectedRoutineId,
 //   activeWorkout: null | draft (see createDraft below),
 // }
+//
+// Routines are templates. Starting a workout copies the routine into `activeWorkout`, and every
+// logged set stores its own exercise name, weight and reps, so editing or deleting a routine
+// only changes future sessions; history is never rewritten.
 
 import { useSyncExternalStore } from 'react';
 import { todayKey } from '../lib/date.js';
 import { convertWeight, roundTo, toKg } from '../lib/units.js';
-import { PLANS, startingWeight } from './plans.js';
+import {
+  DEFAULT_ROUTINE_ID,
+  EXERCISES,
+  PLANS,
+  builtInRoutine,
+  startingWeight,
+  suggestionExercise,
+} from './plans.js';
 
 const KEY = 'tempo:v1';
 
@@ -34,7 +49,41 @@ function initialState() {
     cycleEvents: [],
     sessions: [],
     sets: [],
+    routines: {},
+    selectedRoutineId: DEFAULT_ROUTINE_ID,
     activeWorkout: null,
+  };
+}
+
+/** Drafts saved before routines existed only had rows; fill in the routine snapshot. */
+function migrateDraft(d) {
+  if (!d || d.name) return d;
+  const plan = PLANS[d.planId];
+  if (!plan) return null;
+  const routine = builtInRoutine(d.planId);
+  return {
+    ...d,
+    name: plan.name,
+    subtitle: plan.subtitle,
+    routineVersion: null,
+    exercises: d.exercises.map((dex, i) => {
+      const rex = routine.exercises[i];
+      const sx = suggestionExercise(rex, routine.unit);
+      const cat = EXERCISES[rex.exerciseId];
+      return {
+        ...dex,
+        key: rex.key,
+        exerciseId: rex.exerciseId,
+        name: cat.name,
+        note: rex.note ?? null,
+        timed: !!cat.timed,
+        restSec: null,
+        targetReps: sx.reps,
+        startLb: sx.startLb,
+        startKg: sx.startKg,
+        rows: dex.rows.map((r) => ({ ...r, targetReps: r.targetReps ?? sx.reps })),
+      };
+    }),
   };
 }
 
@@ -53,6 +102,9 @@ function load() {
           ...parsed.prefs,
           restOverrides: { ...(parsed.prefs?.restOverrides ?? {}) },
         },
+        routines: parsed.routines ?? {},
+        selectedRoutineId: parsed.selectedRoutineId ?? DEFAULT_ROUTINE_ID,
+        activeWorkout: migrateDraft(parsed.activeWorkout ?? null),
       };
     }
   } catch {
@@ -189,34 +241,137 @@ export function completedSessionOn(s, date) {
 }
 
 // ---------------------------------------------------------------------------
+// Routines (built-in plans, customized copies of them, and lifter-created workouts)
+// ---------------------------------------------------------------------------
+
+export function getRoutine(s, id) {
+  return s.routines[id] ?? builtInRoutine(id);
+}
+
+export function getSelectedRoutine(s) {
+  return getRoutine(s, s.selectedRoutineId) ?? builtInRoutine(DEFAULT_ROUTINE_ID);
+}
+
+/** Built-ins first (customized version if saved), then the lifter's own, oldest first. */
+export function listRoutines(s) {
+  const builtIns = Object.keys(PLANS).map((id) => getRoutine(s, id));
+  const custom = Object.values(s.routines)
+    .filter((r) => !PLANS[r.id])
+    .sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
+  return [...builtIns, ...custom];
+}
+
+/**
+ * Create or update a routine. Returns its id.
+ * Saving a built-in stores a customized copy under the same id.
+ */
+export function saveRoutine({ id, name, unit, exercises }) {
+  const routineId = id ?? `routine-${uid()}`;
+  setState((s) => {
+    const prev = getRoutine(s, routineId);
+    const now = new Date().toISOString();
+    const routine = {
+      id: routineId,
+      name: name.trim(),
+      builtIn: !!PLANS[routineId],
+      unit,
+      createdAt: prev?.createdAt ?? now,
+      updatedAt: now,
+      exercises: exercises.map((ex) => ({
+        key: ex.key ?? uid(),
+        exerciseId: ex.exerciseId,
+        note: ex.note ?? null,
+        restSec: ex.restSec ?? null,
+        sets: ex.sets.map((set) => ({
+          reps: Number(set.reps) || 0,
+          weight: set.weight === '' || set.weight == null ? 0 : Number(set.weight),
+          durationSec: set.durationSec ?? null,
+        })),
+      })),
+    };
+    const next = { ...s, routines: { ...s.routines, [routineId]: routine } };
+    // An unstarted preview of this routine picks up the edits straight away.
+    const d = s.activeWorkout;
+    if (d && !d.startedAt && d.planId === routineId) next.activeWorkout = createDraft(next, routineId);
+    return next;
+  });
+  return routineId;
+}
+
+export function deleteRoutine(id) {
+  setState((s) => {
+    if (PLANS[id] || s.activeWorkout?.startedAt && s.activeWorkout.planId === id) return s;
+    const routines = { ...s.routines };
+    delete routines[id];
+    const selectedRoutineId = s.selectedRoutineId === id ? DEFAULT_ROUTINE_ID : s.selectedRoutineId;
+    const d = s.activeWorkout;
+    const next = { ...s, routines, selectedRoutineId };
+    if (d && !d.startedAt && d.planId === id) next.activeWorkout = createDraft(next, selectedRoutineId);
+    return next;
+  });
+}
+
+/** Choose the routine the Workout screen shows. Ignored while another workout is running. */
+export function selectRoutine(id) {
+  setState((s) => {
+    const d = s.activeWorkout;
+    if (d?.startedAt && d.planId !== id) return s;
+    const next = { ...s, selectedRoutineId: id };
+    if (!d || (!d.startedAt && d.planId !== id)) next.activeWorkout = createDraft(next, id);
+    return next;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Active workout (draft rows the lifter edits, persisted so a refresh never loses them)
 // ---------------------------------------------------------------------------
 
-function createDraft(s, planId) {
-  const plan = PLANS[planId];
+function createDraft(s, routineId) {
+  const routine = getRoutine(s, routineId) ?? builtInRoutine(DEFAULT_ROUTINE_ID);
   const unit = s.profile.unit;
   const sessionId = uid();
+  const toUnit = (w) => roundTo(convertWeight(w, routine.unit, unit), 0.5);
   return {
     sessionId,
-    planId,
+    planId: routine.id,
+    name: routine.name,
+    subtitle: routine.subtitle ?? null,
+    routineVersion: routine.updatedAt,
     date: todayKey(),
     startedAt: null,
     unit,
     rest: null, // { startedAt, durationSec, exerciseId }
-    exercises: plan.exercises.map((ex) => {
-      const last = lastSessionSets(s, ex.id, sessionId);
-      // Rows start at what the lifter actually did last time (or the plan's start weight);
-      // the suggestion is offered separately so they can accept or ignore it.
+    exercises: routine.exercises.map((rex) => {
+      const cat = EXERCISES[rex.exerciseId];
+      const sx = suggestionExercise(rex, routine.unit);
+      const last = lastSessionSets(s, rex.exerciseId, sessionId);
+      // Sets with no target weight start at what the lifter did last time (or the catalog
+      // start); the suggestion is offered separately so they can accept or ignore it.
       const lastWeight = last.length
         ? roundTo(convertWeight(last[0].weight, last[0].unit, unit), 0.5)
-        : startingWeight(ex, unit);
+        : startingWeight(cat, unit);
       return {
-        exerciseId: ex.id,
+        key: rex.key,
+        exerciseId: rex.exerciseId,
+        name: cat.name,
+        note: rex.note ?? null,
+        timed: !!cat.timed,
+        restSec: rex.restSec ?? null,
+        targetReps: sx.reps,
+        startLb: sx.startLb,
+        startKg: sx.startKg,
         warmup: null, // 'easy' | 'right' | 'heavy'
         acceptedSuggestion: null,
-        rows: Array.from({ length: ex.sets }, (_, i) => ({
-          weight: last[i] ? roundTo(convertWeight(last[i].weight, last[i].unit, unit), 0.5) : lastWeight,
-          reps: last[i] ? last[i].reps : ex.reps,
+        rows: rex.sets.map((t, i) => ({
+          weight:
+            t.weight != null
+              ? toUnit(t.weight)
+              : last[i]
+                ? roundTo(convertWeight(last[i].weight, last[i].unit, unit), 0.5)
+                : lastWeight,
+          reps: t.weight == null && last[i] ? last[i].reps : t.reps,
+          targetReps: t.reps,
+          targetDurationSec: t.durationSec ?? null,
           timer: null, // { durationSec, startedAt }
           doneSetId: null,
         })),
@@ -225,12 +380,18 @@ function createDraft(s, planId) {
   };
 }
 
-/** Make sure there is a draft for today's plan (re-created if an unstarted draft is stale). */
-export function ensureActiveWorkout(planId) {
+/**
+ * Make sure there is a draft for the selected routine. An unstarted draft is rebuilt when it
+ * is from another day, another routine, or an older version of the routine.
+ */
+export function ensureActiveWorkout(routineId) {
   const s = state;
+  const id = routineId ?? s.selectedRoutineId;
   const d = s.activeWorkout;
-  if (d && (d.startedAt || d.date === todayKey())) return;
-  setState((cur) => ({ ...cur, activeWorkout: createDraft(cur, planId) }));
+  if (d?.startedAt) return;
+  const routine = getRoutine(s, id);
+  if (d && d.date === todayKey() && d.planId === id && d.routineVersion === routine?.updatedAt) return;
+  setState((cur) => ({ ...cur, activeWorkout: createDraft(cur, id) }));
 }
 
 function updateDraft(fn) {
@@ -251,11 +412,10 @@ function updateRow(draft, exIdx, rowIdx, patch) {
 function withStarted(draft, s) {
   if (draft.startedAt) return { draft, s };
   const startedAt = Date.now();
-  const plan = PLANS[draft.planId];
   const session = {
     id: draft.sessionId,
     planId: draft.planId,
-    name: plan.name,
+    name: draft.name,
     date: draft.date,
     startedAt,
     endedAt: null,
@@ -265,7 +425,11 @@ function withStarted(draft, s) {
   };
   return {
     draft: { ...draft, startedAt },
-    s: { ...s, sessions: [...s.sessions.filter((x) => x.id !== draft.sessionId), session] },
+    s: {
+      ...s,
+      selectedRoutineId: draft.planId,
+      sessions: [...s.sessions.filter((x) => x.id !== draft.sessionId), session],
+    },
   };
 }
 
@@ -360,9 +524,43 @@ export function cancelSetTimer(exIdx, rowIdx) {
   updateDraft((d) => updateRow(d, exIdx, rowIdx, { timer: null }));
 }
 
-/** Rest length for an exercise: its override if set, otherwise the default. */
-export function restSecFor(s, exerciseId) {
-  return s.prefs.restOverrides?.[exerciseId] ?? s.prefs.restSec;
+/** Rest length for a workout exercise: routine setting, then older per-exercise prefs, then default. */
+export function restSecFor(s, dex) {
+  return dex?.restSec ?? s.prefs.restOverrides?.[dex?.exerciseId] ?? s.prefs.restSec;
+}
+
+/**
+ * Change one exercise's rest from the rest-timer sheet: applies to this workout now and is
+ * saved to the routine for next time (null = use the default).
+ */
+export function setExerciseRest(exIdx, sec) {
+  setState((s) => {
+    const d = s.activeWorkout;
+    if (!d) return s;
+    const dex = d.exercises[exIdx];
+    const restOverrides = { ...s.prefs.restOverrides };
+    delete restOverrides[dex.exerciseId];
+    const activeWorkout = {
+      ...d,
+      exercises: d.exercises.map((ex, i) => (i === exIdx ? { ...ex, restSec: sec } : ex)),
+    };
+    const routine = getRoutine(s, d.planId);
+    let routines = s.routines;
+    if (routine) {
+      const now = new Date().toISOString();
+      routines = {
+        ...routines,
+        [routine.id]: {
+          ...routine,
+          createdAt: routine.createdAt ?? now,
+          updatedAt: now,
+          exercises: routine.exercises.map((rex) => (rex.key === dex.key ? { ...rex, restSec: sec } : rex)),
+        },
+      };
+      activeWorkout.routineVersion = now;
+    }
+    return { ...s, prefs: { ...s.prefs, restOverrides }, routines, activeWorkout };
+  });
 }
 
 /** Log a finished set with the actual weight and reps, then start the rest countdown. */
@@ -373,25 +571,25 @@ export function completeSet(exIdx, rowIdx, { weight, reps, suggestedWeight }) {
     if (s.activeWorkout.exercises[exIdx].rows[rowIdx].doneSetId) return s;
     const r = withStarted(s.activeWorkout, s);
     const d = r.draft;
-    const plan = PLANS[d.planId];
-    const ex = plan.exercises[exIdx];
-    const row = d.exercises[exIdx].rows[rowIdx];
+    const ex = d.exercises[exIdx];
+    const row = ex.rows[rowIdx];
     const id = uid();
     const record = {
       id,
       sessionId: d.sessionId,
       date: d.date,
       planId: d.planId,
-      exerciseId: ex.id,
+      routineName: d.name,
+      exerciseId: ex.exerciseId,
       exerciseName: ex.name,
       setNumber: rowIdx + 1,
       weight: Number(weight),
       unit: d.unit,
       weightKg: Math.round(toKg(Number(weight), d.unit) * 100) / 100,
       reps: Number(reps),
-      targetReps: ex.reps,
+      targetReps: row.targetReps ?? ex.targetReps,
       durationSec: row.timer ? row.timer.durationSec : null,
-      warmup: d.exercises[exIdx].warmup,
+      warmup: ex.warmup,
       suggestedWeight: suggestedWeight ?? null,
       completedAt: new Date().toISOString(),
     };
@@ -402,7 +600,7 @@ export function completeSet(exIdx, rowIdx, { weight, reps, suggestedWeight }) {
         doneSetId: id,
         timer: row.timer ? { ...row.timer, startedAt: null, finished: true } : null,
       }),
-      rest: { startedAt: Date.now(), durationSec: restSecFor(r.s, ex.id), exerciseId: ex.id },
+      rest: { startedAt: Date.now(), durationSec: restSecFor(r.s, ex), exerciseId: ex.exerciseId },
     };
     return { ...r.s, sets: [...r.s.sets, record], activeWorkout: draft };
   });
@@ -424,16 +622,6 @@ export function undoSet(exIdx, rowIdx) {
 /** Default rest between sets, remembered across workouts. */
 export function setRestDuration(sec) {
   setState((s) => ({ ...s, prefs: { ...s.prefs, restSec: sec } }));
-}
-
-/** Per-exercise rest override; pass null to go back to the default. */
-export function setRestOverride(exerciseId, sec) {
-  setState((s) => {
-    const restOverrides = { ...s.prefs.restOverrides };
-    if (sec == null) delete restOverrides[exerciseId];
-    else restOverrides[exerciseId] = sec;
-    return { ...s, prefs: { ...s.prefs, restOverrides } };
-  });
 }
 
 export function addRestTime(sec) {
